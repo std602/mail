@@ -3,11 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>快郵助手 (Mobile Web Mailer)</title>
+    <title>快郵助手 (Mobile Web Mailer) - v1.1</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
-<body class="bg-gray-50 font-sans min-h-screen flex flex-col justify-between">
+<body class="bg-gray-50 font-sans min-h-screen flex flex-col justify-between relative">
+
+    <div class="absolute top-2 right-3 text-xs font-mono text-gray-400 select-none">
+        v1.1
+    </div>
 
     <main class="p-4 max-w-md mx-auto w-full flex-grow">
         <header class="text-center my-6">
@@ -63,20 +67,23 @@
 
     <script>
         /******************************************************************
-         * ⚠️ 重要設定 ⚠️
-         * 請將下方的字串替換為您在 Google Cloud Console 申請的「網頁應用程式」Client ID。
-         * 確保前後單引號、格式皆正確（例如：12345-abcde.apps.googleusercontent.com）
+         * ⚠️ v1.1版 核心除錯檢查點 ⚠️
+         * 請將下方的 YOUR_CLIENT_ID_HERE 改成你完整的用戶端 ID。
+         * 注意：結尾必須包含 .apps.googleusercontent.com 
          ******************************************************************/
         const CLIENT_ID = 'YOUR_CLIENT_ID_HERE.apps.googleusercontent.com';
         
-        // 宣告我們需要的權限：發送 Gmail
         const SCOPES = 'https://www.googleapis.com/auth/gmail.send';
-
         let tokenClient;
         let accessToken = null;
 
-        // 初始化 Google Identity Services
         window.onload = function () {
+            // 檢查是否忘記改 Client ID
+            if (CLIENT_ID.includes('YOUR_CLIENT_ID_HERE')) {
+                alert('【v1.1 提示】您尚未修改程式碼第 89 行的 CLIENT_ID！請替換後再測試。');
+                return;
+            }
+
             try {
                 tokenClient = google.accounts.oauth2.initTokenClient({
                     client_id: CLIENT_ID,
@@ -84,13 +91,10 @@
                     callback: (tokenResponse) => {
                         if (tokenResponse && tokenResponse.access_token) {
                             accessToken = tokenResponse.access_token;
-                            
-                            // 登入成功，切換介面顯示
                             document.getElementById('login-section').classList.add('hidden');
                             document.getElementById('mail-section').classList.remove('hidden');
                             document.getElementById('user-email').innerText = "已連結 Google API";
                             
-                            // 自動讀取上次手機儲存的收件人，方便省時
                             const savedEmail = localStorage.getItem('saved_to_email');
                             if (savedEmail) {
                                 document.getElementById('to-email').value = savedEmail;
@@ -99,20 +103,18 @@
                     },
                 });
             } catch (err) {
-                console.error("Google SDK 初始化失敗，請檢查 Client ID 是否正確：", err);
+                console.error("Google SDK 初始化失敗：", err);
             }
         };
 
-        // 觸發 Google 登入彈出視窗
         function handleAuthClick() {
             if (!tokenClient) {
-                alert('Google 認證套件尚未載入完成，請重新整理網頁再試一次。');
+                alert('認證組件未就緒，請檢查網路或確認 Client ID 是否正確。');
                 return;
             }
             tokenClient.requestAccessToken({ prompt: 'consent' });
         }
 
-        // 登出帳戶
         function handleSignoutClick() {
             if (accessToken) {
                 google.accounts.oauth2.revoke(accessToken, () => {
@@ -123,35 +125,27 @@
             }
         }
 
-        // 手機一鍵貼上功能 (使用瀏覽器 Clipboard API)
         async function pasteFromClipboard() {
             try {
                 const text = await navigator.clipboard.readText();
                 document.getElementById('mail-content').value = text;
             } catch (err) {
-                alert('無法自動讀取剪貼簿。可能原因：瀏覽器不支援、未授予剪貼簿權限。請長按輸入框手動貼上。');
+                alert('無法自動讀取剪貼簿，請長按手動貼上。');
             }
         }
 
-        // 發送郵件核心邏輯
         async function sendEmail() {
             const to = document.getElementById('to-email').value.trim();
             const subject = document.getElementById('mail-subject').value.trim() || '速記內容';
             const content = document.getElementById('mail-content').value;
             const sendBtn = document.getElementById('send-btn');
 
-            // 簡易欄位防呆驗證
-            if (!to) { return alert('請輸入收件人 Email'); }
-            if (!content) { return alert('請輸入郵件內容'); }
+            if (!to || !content) { return alert('請確認收件人與內容皆已填寫'); }
 
-            // 本地記住收件人，下次不用重複輸入
             localStorage.setItem('saved_to_email', to);
-            
-            // 按鈕動態鎖定，防止手機重複點擊
             sendBtn.disabled = true;
             sendBtn.innerText = '正在發送...';
 
-            // 建立標準 RFC 2822 郵件格式，並將中文主題用 Base64 編碼避免亂碼
             const utf8Subject = `=?utf-8?B?${btoa(unescape(encodeURIComponent(subject)))}?=`;
             const emailParts = [
                 `To: ${to}`,
@@ -162,12 +156,7 @@
                 content
             ];
             const email = emailParts.join('\r\n');
-            
-            // 將整封郵件轉為 Google API 要求的 Base64Url 格式
-            const base64EncodedEmail = btoa(unescape(encodeURIComponent(email)))
-                .replace(/\+/g, '-')
-                .replace(/\//g, '_')
-                .replace(/=+$/, '');
+            const base64EncodedEmail = btoa(unescape(encodeURIComponent(email))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
             try {
                 const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
@@ -176,22 +165,19 @@
                         'Authorization': `Bearer ${accessToken}`,
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({
-                        raw: base64EncodedEmail
-                    })
+                    body: JSON.stringify({ raw: base64EncodedEmail })
                 });
 
                 if (response.ok) {
                     alert('🎉 郵件發送成功！');
-                    document.getElementById('mail-content').value = ''; // 成功後清空內容框
+                    document.getElementById('mail-content').value = '';
                 } else {
                     const errData = await response.json();
-                    alert('發送失敗：' + (errData.error.message || '請確認是否已開通 Gmail API 權限'));
+                    alert('發送失敗：' + (errData.error.message || '未知錯誤'));
                 }
             } catch (error) {
-                alert('網路連線異常，請稍後再試：' + error);
+                alert('網路異常：' + error);
             } finally {
-                // 解除按鈕鎖定
                 sendBtn.disabled = false;
                 sendBtn.innerText = '🚀 立即寄出';
             }
