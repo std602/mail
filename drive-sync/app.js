@@ -7,6 +7,17 @@ const GOOGLE_CONFIG = Object.freeze({
 const $ = id => document.getElementById(id);
 const baselines = new Map();
 let token, expires = 0, localRoot, remoteRoot, plan = null, busy = false, cancelled = false, armed = false;
+const nativeExports = Object.freeze({
+  'application/vnd.google-apps.document': {extension: '.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'},
+  'application/vnd.google-apps.spreadsheet': {extension: '.xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},
+  'application/vnd.google-apps.presentation': {extension: '.pptx', mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'},
+});
+const shortcutType = 'application/vnd.google-apps.shortcut';
+function localName(file) {
+  const extension = nativeExports[file.mimeType]?.extension || (file.mimeType === shortcutType ? '.url' : '');
+  return extension && !file.name.toLowerCase().endsWith(extension) ? file.name + extension : file.name;
+}
+function isRepresentation(file) { return !!nativeExports[file?.mimeType] || file?.mimeType === shortcutType; }
 const folderType = 'application/vnd.google-apps.folder';
 const log = message => { $('log').textContent += message + '\n'; };
 function invalidate() { plan = null; armed = false; $('sync').disabled = true; }
@@ -26,7 +37,7 @@ const quote = s => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 async function children(parent) {
   let result = [], pageToken;
   do {
-    const q = new URLSearchParams({q: `'${quote(parent)}' in parents and trashed = false`, fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime)', pageSize: '1000', supportsAllDrives: 'true', includeItemsFromAllDrives: 'true'});
+    const q = new URLSearchParams({q: `'${quote(parent)}' in parents and trashed = false`, fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,shortcutDetails)', pageSize: '1000', supportsAllDrives: 'true', includeItemsFromAllDrives: 'true'});
     if (pageToken) q.set('pageToken', pageToken);
     const data = await api('drive/v3/files?' + q);
     result.push(...data.files); pageToken = data.nextPageToken;
@@ -37,12 +48,28 @@ function checkStop() { if (cancelled) throw Error('已停止；已完成的上�
 async function digest(file) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', await file.arrayBuffer()))].map(b => b.toString(16).padStart(2, '0')).join('');
 }
-function stamp(file) { return [file.id, file.modifiedTime, file.size].join('|'); }
-async function remoteFile(id) {
+function stamp(file) { return [file.id, file.modifiedTime, file.size, JSON.stringify(file.shortcutDetails || null)].join('|'); }
+async function remoteFile(file) {
   auth();
-  const response = await fetch('https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(id) + '?alt=media&supportsAllDrives=true', {headers: {Authorization: 'Bearer ' + token}});
-  if (!response.ok) throw Error('下載失敗：Google API ' + response.status);
-  return response.blob();
+  if (file.mimeType === shortcutType) {
+    const target = file.shortcutDetails?.targetId;
+    if (!target || !/^[A-Za-z0-9_-]+$/.test(target)) throw Error('捷徑目標無效或無法取得。');
+    const key = file.shortcutDetails.targetResourceKey;
+    const url = 'https://drive.google.com/open?id=' + encodeURIComponent(target) + (key ? '&resourcekey=' + encodeURIComponent(key) : '');
+    return new Blob(['[InternetShortcut]\r\nURL=' + url + '\r\n'], {type:'application/internet-shortcut'});
+  }
+  const format = nativeExports[file.mimeType];
+  const path = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(file.id);
+  const url = format ? path + '/export?mimeType=' + encodeURIComponent(format.mime) : path + '?alt=media&supportsAllDrives=true';
+  const response = await fetch(url, {headers: {Authorization: 'Bearer ' + token}});
+  if (!response.ok) {
+    let detail = '';
+    try { detail = (await response.json()).error?.message || ''; } catch {}
+    throw Error((format ? 'Google 文件匯出失敗（Drive 匯出內容上限為 10 MB）' : '下載失敗') + '：Google API ' + response.status + (detail ? ' — ' + detail : ''));
+  }
+  const blob = await response.blob();
+  if (blob.size > 500 * 1024 * 1024) throw Error('下載內容超過單檔 500 MiB 上限。');
+  return blob;
 }
 function validName(name) {
   return name && !/[<>:"/\\|?*\x00-\x1f]/.test(name) && !/[ .]$/.test(name) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name) && name !== '.' && name !== '..';
@@ -56,7 +83,7 @@ async function buildPlan() {
     const existing = parent.id ? await children(parent.id) : [];
     const local = new Map();
     if (directory.handle) for await (const [name, handle] of directory.handle.entries()) local.set(name, handle);
-    const names = new Set([...local.keys(), ...existing.map(f => f.name)]);
+    const names = new Set([...local.keys(), ...existing.map(localName)]);
     const folded = new Map();
     for (const name of names) {
       const key = name.toLowerCase();
@@ -66,7 +93,7 @@ async function buildPlan() {
     }
     for (const name of names) {
       checkStop();
-      const handle = local.get(name), matches = existing.filter(f => f.name === name), fullPath = path + name;
+      const handle = local.get(name), matches = existing.filter(f => localName(f) === name), fullPath = path + name;
       if (matches.length > 1) throw Error('雲端有重複名稱，請先整理：' + fullPath);
       const found = matches[0];
       if (found && handle && (found.mimeType === folderType) !== (handle.kind === 'directory')) throw Error('檔案與資料夾名稱衝突：' + fullPath);
@@ -77,7 +104,7 @@ async function buildPlan() {
         await walk(localChild, child, fullPath + '/');
         continue;
       }
-      if (found?.mimeType.startsWith('application/vnd.google-apps.')) { operations.push({kind:'skip', path: fullPath, reason:'Google 原生文件或捷徑不支援檔案同步'}); continue; }
+      if (found?.mimeType.startsWith('application/vnd.google-apps.') && !isRepresentation(found)) { operations.push({kind:'skip', path: fullPath, reason:'此 Google 原生檔案類型尚不支援匯出'}); continue; }
       const file = handle ? await handle.getFile() : null;
       // Bound memory use: browser hashing and uploads buffer whole files.
       if ((file?.size || 0) > 500 * 1024 * 1024 || Number(found?.size || 0) > 500 * 1024 * 1024) { operations.push({kind:'skip', path:fullPath, reason:'第一版單檔上限為 500 MiB'}); continue; }
@@ -88,10 +115,13 @@ async function buildPlan() {
         const localChanged = !old || old.hash !== hash;
         const remoteChanged = !old || old.stamp !== stamp(found);
         if (!localChanged && !remoteChanged) continue;
-        if (old && localChanged && !remoteChanged) kind = 'file';
+        if (old && localChanged && !remoteChanged) {
+          if (isRepresentation(found)) { operations.push({kind:'conflict',path:fullPath,reason:'本機匯出檔或捷徑已修改，保留本機版本；不覆寫 Google 原稿或捷徑'}); continue; }
+          kind = 'file';
+        }
         else if (old && !localChanged && remoteChanged) kind = 'download';
         else {
-          const remoteHash = await digest(await remoteFile(found.id));
+          const remoteHash = await digest(await remoteFile(found));
           if (remoteHash === hash) { baselines.set(fullPath, {hash, stamp:stamp(found)}); continue; }
           operations.push({kind:'conflict', path:fullPath, reason:'兩邊內容不同，請手動保留或改名後重新預覽'});
           continue;
@@ -106,7 +136,7 @@ async function buildPlan() {
 async function preview() {
   invalidate(); $('log').textContent = '';
   plan = await buildPlan();
-  for (const item of plan) log(`${({folder:'建立雲端資料夾',localFolder:'建立本機資料夾',file:'上傳至雲端',download:'下載至電腦',conflict:'衝突，略過',skip:'不支援，略過'})[item.kind]}：${item.path}${item.reason ? ' — ' + item.reason : ''}`);
+  for (const item of plan) log(`${({folder:'建立雲端資料夾',localFolder:'建立本機資料夾',file:'上傳至雲端',download:'下載至電腦',conflict:'衝突，略過',skip:'不支援，略過'})[item.kind]}：${item.path}${item.found && isRepresentation(item.found) ? (item.found.mimeType === shortcutType ? '（建立網路捷徑，不複製目標內容）' : '（Google 原稿匯出至電腦）') : ''}${item.reason ? ' — ' + item.reason : ''}`);
   $('sync').disabled = !plan.length;
   return `預覽完成：${plan.length} 項變更（包含衝突與略過項目；不會同步刪除）。`;
 }
@@ -118,7 +148,7 @@ async function sync() {
     checkStop();
     if (item.kind === 'conflict' || item.kind === 'skip') { skipped++; log('略過：' + item.path + ' — ' + item.reason); continue; }
     if (item.kind === 'folder') {
-      if ((await children(item.parent.id)).some(f => f.name === item.name)) throw Error('雲端資料夾已變更，請重新預覽：' + item.path);
+      if ((await children(item.parent.id)).some(f => localName(f) === item.name)) throw Error('雲端資料夾已變更，請重新預覽：' + item.path);
       const result = await api('drive/v3/files?supportsAllDrives=true', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:item.name,mimeType:folderType,parents:[item.parent.id]})});
       item.child.id = result.id;
     } else if (item.kind === 'localFolder') {
@@ -126,15 +156,15 @@ async function sync() {
       catch (e) { if (e.name !== 'NotFoundError') throw e; }
       item.localChild.handle = await item.directory.handle.getDirectoryHandle(item.name,{create:true});
     } else {
-      const current = (await children(item.parent.id)).filter(f => f.name === item.name);
+      const current = (await children(item.parent.id)).filter(f => localName(f) === item.name);
       if (item.found ? current.length !== 1 || stamp(current[0]) !== stamp(item.found) : current.length !== 0) throw Error('預覽後雲端已變更，請重新預覽：' + item.path);
       let present;
       try { present = await item.directory.handle.getFileHandle(item.name); }
       catch(e) { if (e.name !== 'NotFoundError') throw e; }
       if (item.handle ? !present || await digest(await present.getFile()) !== item.hash : !!present) throw Error('預覽後本機已變更，請重新預覽：' + item.path);
       if (item.kind === 'download') {
-        const blob = await remoteFile(item.found.id);
-        const latest = await api('drive/v3/files/' + encodeURIComponent(item.found.id) + '?fields=id,size,modifiedTime&supportsAllDrives=true');
+        const blob = await remoteFile(item.found);
+        const latest = await api('drive/v3/files/' + encodeURIComponent(item.found.id) + '?fields=id,size,modifiedTime,shortcutDetails&supportsAllDrives=true');
         if (stamp(latest) !== stamp(item.found)) throw Error('下載期間雲端已變更：' + item.path);
         // Recheck immediately before writing; edits during the write still require user care.
         if (present && await digest(await present.getFile()) !== item.hash) throw Error('下載期間本機已變更：' + item.path);
