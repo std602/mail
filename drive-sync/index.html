@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>電腦與 Google Drive 雙向同步</title>
+<style>body{font:16px system-ui;background:#f2f5fa;color:#172c43;max-width:820px;margin:40px auto;padding:20px}section{background:white;padding:24px;border-radius:16px;margin:18px 0}input{padding:10px;width:90%;margin:8px 0}button{padding:12px;margin:6px 4px 6px 0;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto}small{display:block;color:#526276}h1{font-size:28px}</style>
+<h1>電腦與 Google Drive 雙向同步</h1>
+<p>免安裝 · 雙向同步 · 保留子資料夾 · 衝突不覆寫</p>
+<section><h2>1. 連接 Google</h2><label>OAuth 用戶端 ID<input id="client" placeholder="…apps.googleusercontent.com"></label><label>Google Picker API 金鑰<input id="key" type="password" autocomplete="off"></label><label>Google Cloud 專案編號<input id="project" inputmode="numeric"></label><small>這些設定由工具管理者提供。API 金鑰請限制網站來源與可用 API。為同步所選資料夾內既有的檔案，需要 Google Drive 完整存取授權；程式只操作所選資料夾。登入憑證只保留在記憶體。</small><button id="login">登入 Google</button></section>
+<section><h2>2. 選擇資料夾</h2><button id="local">選擇電腦資料夾</button><span id="localName">尚未選擇</span><br><button id="remote">選擇 Google Drive 資料夾</button><span id="remoteName">尚未選擇</span><p>請使用專用的雲端目的資料夾。同步會寫入電腦與雲端資料夾。兩邊同時修改時會略過並提示；單邊刪除會從另一邊補回，不會同步刪除。</p></section>
+<section><h2>3. 預覽與同步</h2><button id="preview">預覽差異</button><button id="sync" disabled>開始同步預覽內容</button><button id="stop">停止</button><label><input id="auto" type="checkbox" style="width:auto">首次手動同步成功後，每 60 秒自動同步</label><small>網頁必須保持開啟，電腦需保持喚醒。瀏覽器背景節流可能延後同步；登入過期時需重新登入。關閉網頁會清除設定與比對紀錄；重新開啟後，兩邊內容不同的既有檔案須手動處理。單檔上限 500 MiB，不支援 Google 文件、試算表與捷徑。同步時請暫停編輯檔案。</small><p id="status" role="status">尚未登入</p><pre id="log"></pre></section>
+<script src="https://accounts.google.com/gsi/client" async></script>
+<script src="https://apis.google.com/js/api.js" async></script>
+<script type="module" src="app.js"></script>
+</html>
