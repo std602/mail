@@ -18,6 +18,51 @@ function localName(file) {
   return extension && !file.name.toLowerCase().endsWith(extension) ? file.name + extension : file.name;
 }
 function isRepresentation(file) { return !!nativeExports[file?.mimeType] || file?.mimeType === shortcutType; }
+let rememberedRemote = null, restoredRemotePending = false;
+function folderStore(mode, action) {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') { reject(Error('瀏覽器不支援資料夾記憶')); return; }
+    const open = indexedDB.open('drive-sync-folders', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('settings');
+    open.onerror = () => reject(open.error);
+    open.onblocked = () => reject(Error('資料夾記憶被其他分頁阻擋，請關閉其他分頁再試。'));
+    open.onsuccess = () => {
+      const db = open.result;
+      let tx, request;
+      try { tx = db.transaction('settings', mode); request = action(tx.objectStore('settings')); }
+      catch(e) { db.close(); reject(e); return; }
+      tx.oncomplete = () => { db.close(); resolve(request.result); };
+      tx.onabort = tx.onerror = () => { db.close(); reject(tx.error || Error('無法儲存資料夾記憶')); };
+    };
+  });
+}
+async function saveFolders() {
+  try {
+    await folderStore('readwrite', store => store.put({local:localRoot || null, remote:rememberedRemote}, 'selection'));
+    $('memoryStatus').textContent = '已記住資料夾，僅儲存在這個瀏覽器。';
+  } catch(e) { $('memoryStatus').textContent = '本次仍可同步，但無法記住資料夾：' + e.message; }
+}
+async function restoreFolders() {
+  if (typeof indexedDB === 'undefined') return;
+  const controls = ['local','remote','login','preview','restoreLocal','forget'];
+  for (const id of controls) $(id).disabled = true;
+  try {
+    const saved = await folderStore('readonly', store => store.get('selection'));
+    if (saved?.local?.kind === 'directory') {
+      localRoot = saved.local;
+      $('localName').textContent = localRoot.name;
+      const permission = await localRoot.queryPermission({mode:'readwrite'});
+      $('restoreLocal').hidden = permission === 'granted';
+      if (permission !== 'granted') $('localName').textContent += '（請重新授權）';
+    }
+    if (saved?.remote?.id && saved.remote.name) {
+      rememberedRemote = saved.remote; remoteRoot = rememberedRemote.id; restoredRemotePending = true;
+      $('remoteName').textContent = rememberedRemote.name + '（登入後確認存取權）';
+    }
+    if (saved) $('memoryStatus').textContent = '已恢復上次資料夾。請登入 Google，必要時重新授權電腦資料夾，再預覽。';
+  } catch(e) { $('memoryStatus').textContent = '無法恢復資料夾，請重新選擇：' + e.message; }
+  finally { for (const id of controls) $(id).disabled = false; }
+}
 const folderType = 'application/vnd.google-apps.folder';
 const log = message => { $('log').textContent += message + '\n'; };
 function invalidate() { plan = null; armed = false; $('sync').disabled = true; }
@@ -77,6 +122,18 @@ function validName(name) {
 async function buildPlan() {
   auth();
   if (!localRoot || !remoteRoot) throw Error('請先選擇兩個資料夾。');
+  if (localRoot.queryPermission && await localRoot.queryPermission({mode:'readwrite'}) !== 'granted') {
+    $('restoreLocal').hidden = false;
+    throw Error('請先按「授權上次的電腦資料夾」，或重新選擇資料夾。');
+  }
+  if (restoredRemotePending) {
+    const folder = await api('drive/v3/files/' + encodeURIComponent(remoteRoot) + '?fields=id,name,mimeType,trashed&supportsAllDrives=true');
+    if (folder.trashed || folder.mimeType !== folderType) throw Error('記住的 Drive 資料夾已移除或不是資料夾，請重新選擇。');
+    rememberedRemote = {id:folder.id,name:folder.name};
+    $('remoteName').textContent = folder.name;
+    restoredRemotePending = false;
+    await saveFolders();
+  }
   const operations = [];
   async function walk(directory, parent, path) {
     checkStop();
@@ -192,26 +249,26 @@ async function sync() {
 async function run(action) {
   if (busy) return;
   busy = true; cancelled = false;
-  for (const id of ['local','remote','login','preview','sync']) $(id).disabled = true;
+  for (const id of ['local','remote','login','preview','sync','restoreLocal','forget']) $(id).disabled = true;
   $('status').textContent = '處理中…';
   try { $('status').textContent = await action(); }
   catch (e) { invalidate(); $('status').textContent = e.message; log(e.message); }
-  finally { busy = false; for (const id of ['local','remote','login','preview']) $(id).disabled = false; $('sync').disabled = !plan?.length; }
+  finally { busy = false; for (const id of ['local','remote','login','preview','restoreLocal','forget']) $(id).disabled = false; $('sync').disabled = !plan?.length; }
 }
 $('login').onclick = () => {
   if (!window.google?.accounts) { $('status').textContent = 'Google 登入元件尚未載入，請檢查網路。'; return; }
   if (!GOOGLE_CONFIG.clientId.endsWith('.apps.googleusercontent.com')) { $('status').textContent = '網站的 Google 登入設定尚未完成，請聯絡管理者。'; return; }
   google.accounts.oauth2.initTokenClient({client_id: GOOGLE_CONFIG.clientId, scope: 'https://www.googleapis.com/auth/drive', callback: result => {
-    invalidate(); baselines.clear(); remoteRoot = null; $('remoteName').textContent = '尚未選擇';
+    invalidate(); baselines.clear(); restoredRemotePending = !!remoteRoot;
     if (result.error) { $('status').textContent = result.error; return; }
     token = result.access_token; expires = Date.now() + (Number(result.expires_in) - 60) * 1000;
-    $('status').textContent = '已登入，請選擇資料夾。';
+    $('status').textContent = localRoot && remoteRoot ? '已登入；已恢復資料夾，請先預覽。' : '已登入，請選擇資料夾。';
   }, error_callback: () => { $('status').textContent = '登入未完成，請檢查彈出視窗與公司授權政策。'; }}).requestAccessToken({prompt: 'consent'});
 };
 $('local').onclick = () => run(async () => {
   if (!window.showDirectoryPicker) throw Error('請使用桌面 Chrome 或 Edge，並透過 HTTPS 或 localhost 開啟。');
   const selected = await window.showDirectoryPicker({mode: 'readwrite'});
-  localRoot = selected; baselines.clear(); invalidate(); $('localName').textContent = selected.name; return '已選擇電腦資料夾。';
+  localRoot = selected; baselines.clear(); invalidate(); $('localName').textContent = selected.name; $('restoreLocal').hidden = true; await saveFolders(); return '已選擇電腦資料夾。';
 });
 $('remote').onclick = () => run(async () => {
   auth();
@@ -219,8 +276,8 @@ $('remote').onclick = () => run(async () => {
   await new Promise((resolve,reject) => gapi.load('picker', {callback: resolve, onerror: () => reject(Error('Picker 載入失敗')), timeout: 15000, ontimeout: () => reject(Error('Picker 載入逾時'))}));
   return new Promise(resolve => {
     const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS).setIncludeFolders(true).setSelectFolderEnabled(true);
-    new google.picker.PickerBuilder().addView(view).setOAuthToken(token).setDeveloperKey(GOOGLE_CONFIG.pickerApiKey).setAppId(GOOGLE_CONFIG.projectNumber).setOrigin(location.origin).setCallback(data => {
-      if (data.action === google.picker.Action.PICKED) { remoteRoot = data.docs[0].id; baselines.clear(); invalidate(); $('remoteName').textContent = data.docs[0].name; resolve('已選擇 Google Drive 目的資料夾。'); }
+    new google.picker.PickerBuilder().addView(view).setOAuthToken(token).setDeveloperKey(GOOGLE_CONFIG.pickerApiKey).setAppId(GOOGLE_CONFIG.projectNumber).setOrigin(location.origin).setCallback(async data => {
+      if (data.action === google.picker.Action.PICKED) { remoteRoot = data.docs[0].id; baselines.clear(); invalidate(); $('remoteName').textContent = data.docs[0].name; rememberedRemote = {id:remoteRoot,name:data.docs[0].name}; restoredRemotePending = true; await saveFolders(); resolve('已選擇 Google Drive 目的資料夾。'); }
       if (data.action === google.picker.Action.CANCEL) resolve('已取消選擇。');
     }).build().setVisible(true);
   });
@@ -230,3 +287,21 @@ $('sync').onclick = () => run(sync);
 $('stop').onclick = () => { cancelled = true; armed = false; $('auto').checked = false; $('status').textContent = '停止自動同步；進行中的單一請求結束後停止。'; };
 setInterval(() => { if ($('auto').checked && armed && !busy) run(async () => { plan = await buildPlan(); return sync(); }); }, 60000);
 window.addEventListener('beforeunload', e => { if (busy) { e.preventDefault(); e.returnValue = ''; } });
+
+$('restoreLocal').onclick = () => run(async () => {
+  if (!localRoot?.requestPermission) throw Error('請重新選擇電腦資料夾。');
+  if (await localRoot.requestPermission({mode:'readwrite'}) !== 'granted') throw Error('未取得資料夾權限；可再次授權或重新選擇。');
+  $('restoreLocal').hidden = true;
+  $('localName').textContent = localRoot.name;
+  return '已取得電腦資料夾權限，請預覽同步內容。';
+});
+$('forget').onclick = () => run(async () => {
+  await folderStore('readwrite', store => store.delete('selection'));
+  localRoot = null; remoteRoot = null; rememberedRemote = null; restoredRemotePending = false;
+  baselines.clear(); invalidate(); $('auto').checked = false;
+  $('localName').textContent = $('remoteName').textContent = '尚未選擇';
+  $('restoreLocal').hidden = true;
+  $('memoryStatus').textContent = '已忘記資料夾；電腦與 Drive 的檔案未刪除。';
+  return '已清除資料夾選擇。';
+});
+restoreFolders();

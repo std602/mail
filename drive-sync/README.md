@@ -19,6 +19,12 @@
 3. 先預覽再同步。會同步雙方新增檔案和子資料夾；建立比對紀錄後，同一檔案只在一邊修改時會更新另一邊。
 4. 可選擇每 60 秒自動同步。必須先完成手動同步。保持網頁開啟和電腦喚醒；背景分頁可能延遲執行，Google 授權過期後需重新登入。
 
+## 記住資料夾
+
+選擇後自動將電腦資料夾控制代碼與 Drive 資料夾 ID／名稱儲存在此網站的 IndexedDB。重開同一瀏覽器會恢復選擇，仍需登入 Google；若瀏覽器要求權限，按「授權上次的電腦資料夾」。恢復後須手動預覽與同步，自動同步不會直接啟動。
+
+Google 登入憑證、檔案內容與同步比對紀錄不會存入這份記憶。切換 Google 帳號後會重新檢查 Drive 資料夾存取權，必要時請重選。無痕模式、清除網站資料或換電腦／瀏覽器後，記憶可能消失。按「忘記資料夾」只清除網站的選擇記憶，不刪除任何檔案，也不撤銷 Google 授權。
+
 ## 保護與限制
 
 - 不同步刪除：單邊刪除會補回，改名會視為新增路徑，舊路徑可能補回。
@@ -46,6 +52,7 @@
 ```sh
 python3 -m http.server 8000 --bind 127.0.0.1
 node --test drive-sync/sync.test.cjs
+python3 drive-sync/memory.test.py  # 需已安裝 Playwright 與 Chromium
 ```
 
 本機開發開啟 `http://localhost:8000/drive-sync/`。正式使用者只需開啟已部署網站，不必安裝 Python。網路需允許 `accounts.google.com`、`apis.google.com`、`www.googleapis.com`、`drive.google.com` 及 Google 元件的必要靜態資源（例如 `www.gstatic.com`）。
