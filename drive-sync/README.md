@@ -8,13 +8,13 @@
 2. 設定 OAuth 同意畫面。測試模式請加入使用者為測試使用者；正式對外使用可能需要 Google 的應用程式驗證。Workspace 管理政策可能禁止授權。
 3. 建立「網頁應用程式」OAuth 用戶端，設定網站的 Authorized JavaScript origins，例如本機開發使用 `http://localhost:8000`。正式使用請部署至可信任的 HTTPS 靜態網站，設定其實際 origin。不要填頁面路徑。
 4. 建立 Picker 使用的瀏覽器 API 金鑰，限制 HTTP referrers 為該網站，並限制至 Google Picker API。準備同一專案的數字「專案編號」，不是專案 ID。
-5. 將 OAuth Client ID、Picker API 金鑰、專案編號提供給使用者。這是瀏覽器公開設定，**不需要 OAuth client secret**，也不要把 client secret 填入頁面。
+5. 將 OAuth Client ID、Picker API 金鑰、專案編號填入 `app.js` 頂端的 `GOOGLE_CONFIG` 後部署網站，使用者不需要填寫。這是瀏覽器公開設定，**不需要 OAuth client secret**，也不要把 client secret 填入頁面。
 
 為讀取選定資料夾內既有檔案與子資料夾，本工具使用 `https://www.googleapis.com/auth/drive` 完整 Drive 權限。`drive.file` 不能代表已取得資料夾內全部既有子檔案的授權。請先確認公司允許這項存取權；不要用此工具繞過公司政策。程式沒有分析服務或自建後端，檔案直接傳送到 Google API。
 
 ## 使用
 
-1. 開啟 HTTPS 網站上的 `/drive-sync/`，填入上述設定並登入。
+1. 開啟 HTTPS 網站上的 `/drive-sync/`，按「登入 Google」完成授權。
 2. 選擇電腦資料夾，授予讀取及寫入權限；透過 Google Picker 選擇雲端資料夾。
 3. 先預覽再同步。會同步雙方新增檔案和子資料夾；建立比對紀錄後，同一檔案只在一邊修改時會更新另一邊。
 4. 可選擇每 60 秒自動同步。必須先完成手動同步。保持網頁開啟和電腦喚醒；背景分頁可能延遲執行，Google 授權過期後需重新登入。

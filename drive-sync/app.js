@@ -1,3 +1,9 @@
+// Public browser configuration only. Never put an OAuth client secret here.
+const GOOGLE_CONFIG = Object.freeze({
+  clientId: '462063782430-uh2oa4j632okceojlqkqq17u5cqrfh09.apps.googleusercontent.com',
+  pickerApiKey: 'AIzaSyCOxwENdMDE2vGKll0f8WcC8_RVRZot-Xo',
+  projectNumber: '462063782430',
+});
 const $ = id => document.getElementById(id);
 const baselines = new Map();
 let token, expires = 0, localRoot, remoteRoot, plan = null, busy = false, cancelled = false, armed = false;
@@ -164,8 +170,8 @@ async function run(action) {
 }
 $('login').onclick = () => {
   if (!window.google?.accounts) { $('status').textContent = 'Google 登入元件尚未載入，請檢查網路。'; return; }
-  if (!$('client').value.trim().endsWith('.apps.googleusercontent.com')) { $('status').textContent = '請填入有效的 OAuth 用戶端 ID。'; return; }
-  google.accounts.oauth2.initTokenClient({client_id: $('client').value.trim(), scope: 'https://www.googleapis.com/auth/drive', callback: result => {
+  if (!GOOGLE_CONFIG.clientId.endsWith('.apps.googleusercontent.com')) { $('status').textContent = '網站的 Google 登入設定尚未完成，請聯絡管理者。'; return; }
+  google.accounts.oauth2.initTokenClient({client_id: GOOGLE_CONFIG.clientId, scope: 'https://www.googleapis.com/auth/drive', callback: result => {
     invalidate(); baselines.clear(); remoteRoot = null; $('remoteName').textContent = '尚未選擇';
     if (result.error) { $('status').textContent = result.error; return; }
     token = result.access_token; expires = Date.now() + (Number(result.expires_in) - 60) * 1000;
@@ -179,11 +185,11 @@ $('local').onclick = () => run(async () => {
 });
 $('remote').onclick = () => run(async () => {
   auth();
-  if (!window.gapi || !$('key').value.trim() || !$('project').value.trim()) throw Error('請填寫 Picker API 金鑰與專案編號，並確認 Google API 元件載入。');
+  if (!window.gapi || !GOOGLE_CONFIG.pickerApiKey || !GOOGLE_CONFIG.projectNumber) throw Error('Google 資料夾選擇器尚未就緒，請稍後重試；若持續失敗請聯絡管理者。');
   await new Promise((resolve,reject) => gapi.load('picker', {callback: resolve, onerror: () => reject(Error('Picker 載入失敗')), timeout: 15000, ontimeout: () => reject(Error('Picker 載入逾時'))}));
   return new Promise(resolve => {
     const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS).setIncludeFolders(true).setSelectFolderEnabled(true);
-    new google.picker.PickerBuilder().addView(view).setOAuthToken(token).setDeveloperKey($('key').value.trim()).setAppId($('project').value.trim()).setOrigin(location.origin).setCallback(data => {
+    new google.picker.PickerBuilder().addView(view).setOAuthToken(token).setDeveloperKey(GOOGLE_CONFIG.pickerApiKey).setAppId(GOOGLE_CONFIG.projectNumber).setOrigin(location.origin).setCallback(data => {
       if (data.action === google.picker.Action.PICKED) { remoteRoot = data.docs[0].id; baselines.clear(); invalidate(); $('remoteName').textContent = data.docs[0].name; resolve('已選擇 Google Drive 目的資料夾。'); }
       if (data.action === google.picker.Action.CANCEL) resolve('已取消選擇。');
     }).build().setVisible(true);
