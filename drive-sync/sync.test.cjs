@@ -6,7 +6,7 @@ const {webcrypto} = require('node:crypto');
 function directory(initial={}) {
  const entries = new Map(Object.entries(initial));
  const missing=()=>Object.assign(Error('missing'),{name:'NotFoundError'});
- return {kind:'directory', entries:async function*(){yield* entries;},
+ return {kind:'directory', async removeEntry(name){entries.delete(name);}, entries:async function*(){yield* entries;},
  async getFileHandle(name,opts={}) { if(!entries.has(name)&&opts.create) entries.set(name,file('')); if(!entries.has(name))throw missing();return entries.get(name); },
  async getDirectoryHandle(name,opts={}) {if(!entries.has(name)&&opts.create)entries.set(name,directory());if(!entries.has(name))throw missing();return entries.get(name);}, map:entries};
 }
@@ -15,13 +15,15 @@ function setup(local,remotes=[]) {
  const nodes=new Map(), records=remotes.map(x=>({...x})), uploads=[];
  const context=vm.createContext({console,URLSearchParams,Blob,File,crypto:webcrypto,Date,Map,Set,Uint8Array,Error,Number,JSON,encodeURIComponent,setInterval:()=>{},window:{addEventListener(){}},document:{getElementById(id){if(!nodes.has(id))nodes.set(id,{textContent:'',value:'',disabled:false,checked:false});return nodes.get(id);}},fetch:async(url,opts={})=>{
   const u=new URL(url), id=u.pathname.split('/').pop();
+  if(id==='root')return {ok:true,json:async()=>({id:'root',mimeType:'application/vnd.google-apps.folder',trashed:false})};
+  if(opts.method==='PATCH' && !u.pathname.startsWith('/upload/')){const r=records.find(x=>x.id===id);Object.assign(r,JSON.parse(opts.body));return {ok:true,json:async()=>r};}
   if(u.pathname.endsWith('/export')){const r=records.find(x=>x.id===u.pathname.split('/').at(-2));return {ok:!r.exportError,status:r.exportError?403:200,json:async()=>({error:{message:'exportSizeLimitExceeded'}}),blob:async()=>new Blob([r.content])};}
   if(u.searchParams.get('alt')==='media'){const r=records.find(x=>x.id===id);return {ok:!!r,blob:async()=>new Blob([r.content])};}
   if(u.pathname.startsWith('/upload/')){uploads.push(opts); const saved={id:id==='files'?'new':id,size:'3',modifiedTime:'2026-01-02T00:00:00Z'};return {ok:true,json:async()=>saved};}
-  if(u.searchParams.has('q')) return {ok:true,json:async()=>({files:records.filter(x=>(x.parent||'root')===u.searchParams.get('q').match(/^'([^']+)'/)[1])})};
-  return {ok:true,json:async()=>records.find(x=>x.id===id)};
+  if(u.searchParams.has('q')) return {ok:true,json:async()=>({files:records.filter(x=>!x.trashed && (x.parent||'root')===u.searchParams.get('q').match(/^'([^']+)'/)[1])})};
+  return {ok:true,json:async()=>{const r=records.find(x=>x.id===id);return r ? {...r,parents:[r.parent||'root']} : undefined;}};
  }});
- vm.runInContext(fs.readFileSync(__dirname+'/app.js','utf8')+'\n globalThis.testing={buildPlan,sync,digest,baselines,setPlan:p=>plan=p,setRoots:(l)=>{localRoot=l;remoteRoot="root";token="test";expires=Infinity;}};',context);
+ vm.runInContext(fs.readFileSync(__dirname+'/app.js','utf8')+'\n globalThis.testing={buildPlan,sync,digest,baselines,directoryBaselines,setPlan:p=>plan=p,setRoots:(l)=>{localRoot=l;remoteRoot="root";token="test";expires=Infinity;}};',context);
  context.testing.setRoots(local);
  return {t:context.testing,records,uploads};
 }
@@ -36,7 +38,7 @@ test('changes since preview block upload',async()=>{const local=directory({'a.tx
 test('duplicate names block preview',async()=>{const {t}=setup(directory(),[remote(),{...remote(),id:'r2'}]);await assert.rejects(()=>t.buildPlan(),/重複名稱/);});
 test('cloud-only nested folder downloads',async()=>{const local=directory();const {t}=setup(local,[{id:'dir',name:'sub',mimeType:'application/vnd.google-apps.folder'}, {...remote('new'),parent:'dir'}]);const p=await t.buildPlan();assert.deepEqual(Array.from(p,x=>x.kind),['localFolder','download']);t.setPlan(p);await t.sync();assert.equal(await(await local.map.get('sub').map.get('a.txt').getFile()).text(),'new');});
 test('unsupported Google Forms are explicitly skipped',async()=>{const {t}=setup(directory(),[{...remote(),mimeType:'application/vnd.google-apps.form'}]);assert.equal((await t.buildPlan())[0].kind,'skip');});
-test('local deletion restores from cloud',async()=>{const local=directory({'a.txt':file('old')});const {t}=setup(local,[remote()]);await t.buildPlan();local.map.delete('a.txt');assert.equal((await t.buildPlan())[0].kind,'download');});
+test('local deletion plans cloud trash',async()=>{const local=directory({'a.txt':file('old')});const {t}=setup(local,[remote()]);await t.buildPlan();local.map.delete('a.txt');assert.equal((await t.buildPlan())[0].kind,'deleteRemote');});
 
 for (const [type,extension] of [['document','.docx'],['spreadsheet','.xlsx'],['presentation','.pptx']]) {
  test(`Google ${type} exports and does not upload its local representation`,async()=>{
@@ -66,4 +68,48 @@ test('preexisting modified native export conflicts instead of uploading',async()
 });
 test('export failure preserves existing local file',async()=>{
  const local=directory();const {t,records}=setup(local,[{...remote('original'),name:'Report',mimeType:'application/vnd.google-apps.document'}]);t.setPlan(await t.buildPlan());await t.sync();records[0].exportError=true;records[0].modifiedTime='2026-03-01T00:00:00Z';t.setPlan(await t.buildPlan());await assert.rejects(()=>t.sync(),/10 MB/);assert.equal(await(await local.map.get('Report.docx').getFile()).text(),'original');
+});
+
+test('local file deletion trashes remote and clears baseline',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();local.map.delete('a.txt');t.setPlan(await t.buildPlan());await t.sync();assert.equal(records[0].trashed,true);assert.equal(t.baselines.size,0);
+});
+test('cloud trash deletes unchanged local file',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();records[0].trashed=true;const plan=await t.buildPlan();assert.equal(plan[0].kind,'deleteLocal');t.setPlan(plan);await t.sync();assert.equal(local.map.has('a.txt'),false);
+});
+test('delete versus remote edit conflicts',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();local.map.delete('a.txt');records[0].modifiedTime='changed';assert.equal((await t.buildPlan())[0].kind,'conflict');
+});
+test('delete versus local edit conflicts',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();records[0].trashed=true;local.map.set('a.txt',file('edited'));assert.equal((await t.buildPlan())[0].kind,'conflict');
+});
+test('unconfirmed remote disappearance does not delete local data',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();records.splice(0);assert.equal((await t.buildPlan())[0].kind,'conflict');assert.equal(local.map.has('a.txt'),true);
+});
+test('local file recreated after preview cancels cloud trash',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();local.map.delete('a.txt');t.setPlan(await t.buildPlan());local.map.set('a.txt',file('new'));await assert.rejects(()=>t.sync(),/已變更/);assert.equal(records[0].trashed,undefined);
+});
+test('local edit after deletion preview cancels local removal',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();records[0].trashed=true;t.setPlan(await t.buildPlan());local.map.set('a.txt',file('edited'));await assert.rejects(()=>t.sync(),/本機內容已修改/);assert.equal(local.map.has('a.txt'),true);
+});
+const folderRemote=()=>({id:'dir',name:'sub',mimeType:'application/vnd.google-apps.folder'});
+test('deleted local directory trashes unchanged cloud directory',async()=>{
+ const local=directory({sub:directory({'a.txt':file('old')})});const {t,records}=setup(local,[folderRemote(),{...remote(),parent:'dir'}]);await t.buildPlan();local.map.delete('sub');const p=await t.buildPlan();assert.equal(p.length,1);assert.equal(p[0].kind,'deleteRemote');t.setPlan(p);await t.sync();assert.equal(records[0].trashed,true);assert.equal(t.baselines.size,0);assert.equal(t.directoryBaselines.size,0);
+});
+test('trashed cloud directory removes unchanged local directory',async()=>{
+ const local=directory({sub:directory({'a.txt':file('old')})});const {t,records}=setup(local,[folderRemote(),{...remote(),parent:'dir'}]);await t.buildPlan();records[0].trashed=true;const p=await t.buildPlan();assert.equal(p[0].kind,'deleteLocal');t.setPlan(p);await t.sync();assert.equal(local.map.has('sub'),false);
+});
+test('new cloud descendant prevents directory deletion',async()=>{
+ const local=directory({sub:directory({'a.txt':file('old')})});const {t,records}=setup(local,[folderRemote(),{...remote(),parent:'dir'}]);await t.buildPlan();local.map.delete('sub');records.push({...remote(),id:'new',name:'new.txt',parent:'dir'});assert.equal((await t.buildPlan())[0].kind,'conflict');
+});
+test('new local descendant prevents directory deletion',async()=>{
+ const sub=directory({'a.txt':file('old')});const local=directory({sub});const {t,records}=setup(local,[folderRemote(),{...remote(),parent:'dir'}]);await t.buildPlan();records[0].trashed=true;sub.map.set('new.txt',file('new'));assert.equal((await t.buildPlan())[0].kind,'conflict');
+});
+test('both-side deletion clears stale baseline before later additions',async()=>{
+ const local=directory({'a.txt':file('old')});const {t,records}=setup(local,[remote()]);await t.buildPlan();local.map.delete('a.txt');records[0].trashed=true;assert.equal((await t.buildPlan()).length,0);assert.equal(t.baselines.size,0);local.map.set('a.txt',file('new'));assert.equal((await t.buildPlan())[0].kind,'file');
+});
+test('deleting local Google export trashes original after baseline',async()=>{
+ const local=directory();const {t,records}=setup(local,[{...remote('export'),name:'Report',mimeType:'application/vnd.google-apps.document'}]);t.setPlan(await t.buildPlan());await t.sync();local.map.delete('Report.docx');const p=await t.buildPlan();assert.equal(p[0].kind,'deleteRemote');t.setPlan(p);await t.sync();assert.equal(records[0].trashed,true);
+});
+test('deleting shortcut trashes only shortcut',async()=>{
+ const local=directory();const {t,records}=setup(local,[{...remote(),name:'Link',mimeType:'application/vnd.google-apps.shortcut',shortcutDetails:{targetId:'target'}}]);t.setPlan(await t.buildPlan());await t.sync();local.map.delete('Link.url');t.setPlan(await t.buildPlan());await t.sync();assert.equal(records[0].trashed,true);
 });

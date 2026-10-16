@@ -6,6 +6,8 @@ const GOOGLE_CONFIG = Object.freeze({
 });
 const $ = id => document.getElementById(id);
 const baselines = new Map();
+const directoryBaselines = new Map();
+function clearBaselines() { baselines.clear(); directoryBaselines.clear(); }
 let token, expires = 0, localRoot, remoteRoot, plan = null, busy = false, cancelled = false, armed = false;
 const nativeExports = Object.freeze({
   'application/vnd.google-apps.document': {extension: '.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'},
@@ -38,7 +40,7 @@ function folderStore(mode, action) {
 }
 async function saveFolders() {
   try {
-    await folderStore('readwrite', store => store.put({local:localRoot || null, remote:rememberedRemote}, 'selection'));
+    await folderStore('readwrite', store => store.put({local:localRoot || null, remote:rememberedRemote, baselines:[...baselines], directories:[...directoryBaselines]}, 'selection'));
     $('memoryStatus').textContent = '已記住資料夾，僅儲存在這個瀏覽器。';
   } catch(e) { $('memoryStatus').textContent = '本次仍可同步，但無法記住資料夾：' + e.message; }
 }
@@ -58,6 +60,10 @@ async function restoreFolders() {
     if (saved?.remote?.id && saved.remote.name) {
       rememberedRemote = saved.remote; remoteRoot = rememberedRemote.id; restoredRemotePending = true;
       $('remoteName').textContent = rememberedRemote.name + '（登入後確認存取權）';
+    }
+    if (localRoot && remoteRoot) {
+      for (const [path, entry] of saved.baselines || []) baselines.set(path,entry);
+      for (const [path, entry] of saved.directories || []) directoryBaselines.set(path,entry);
     }
     if (saved) $('memoryStatus').textContent = '已恢復上次資料夾。請登入 Google，必要時重新授權電腦資料夾，再預覽。';
   } catch(e) { $('memoryStatus').textContent = '無法恢復資料夾，請重新選擇：' + e.message; }
@@ -119,6 +125,66 @@ async function remoteFile(file) {
 function validName(name) {
   return name && !/[<>:"/\\|?*\x00-\x1f]/.test(name) && !/[ .]$/.test(name) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name) && name !== '.' && name !== '..';
 }
+function dropBaseline(path) {
+  for (const map of [baselines,directoryBaselines]) for (const key of map.keys()) if (key === path || key.startsWith(path + '/')) map.delete(key);
+}
+async function localEntry(directory,name) {
+  for await (const [entry,handle] of directory.entries()) if (entry === name) return handle;
+  return null;
+}
+async function confirmedDriveRemoval(id,parentId) {
+  // A missing list entry can mean lost access, not deletion. GET must succeed.
+  const info = await api('drive/v3/files/' + encodeURIComponent(id) + '?fields=id,trashed,parents&supportsAllDrives=true');
+  return !!info && (info.trashed === true || (Array.isArray(info.parents) && !info.parents.includes(parentId)));
+}
+async function unchangedTree(side,node,path) {
+  const seen = new Set();
+  async function visit(current,prefix) {
+    checkStop();
+    const entries = side === 'local' ? [] : await children(current.id);
+    if (side === 'local') for await (const [name,handle] of current.entries()) entries.push({name,handle});
+    for (const entry of entries) {
+      const key = prefix + '/' + (side === 'local' ? entry.name : localName(entry));
+      if (seen.has(key)) return false;
+      seen.add(key);
+      const directory = side === 'local' ? entry.handle.kind === 'directory' : entry.mimeType === folderType;
+      if (directory) {
+        const old = directoryBaselines.get(key);
+        if (!old || (side === 'remote' && old.id !== entry.id)) return false;
+        if (!await visit(side === 'local' ? entry.handle : entry,key)) return false;
+      } else {
+        const old = baselines.get(key);
+        if (!old) return false;
+        if (side === 'local' ? await digest(await entry.handle.getFile()) !== old.hash : stamp(entry) !== old.stamp) return false;
+      }
+    }
+    return true;
+  }
+  if (!await visit(node,path)) return false;
+  const expected = [...baselines.keys(),...directoryBaselines.keys()].filter(key => key.startsWith(path + '/'));
+  return expected.length === seen.size && expected.every(key => seen.has(key));
+}
+async function executeDeletion(item) {
+  const root = await api('drive/v3/files/' + encodeURIComponent(remoteRoot) + '?fields=id,mimeType,trashed&supportsAllDrives=true');
+  if (!root || root.trashed || root.mimeType !== folderType) throw Error('同步根資料夾無法存取，停止刪除。');
+  const cloud = (await children(item.parent.id)).filter(f => localName(f) === item.name);
+  const local = await localEntry(item.directory.handle,item.name);
+  if (item.kind === 'deleteRemote') {
+    if (local || cloud.length !== 1 || cloud[0].id !== item.found.id) throw Error('刪除前項目已變更，請重新預覽：' + item.path);
+    const unchanged = item.isFolder ? await unchangedTree('remote',cloud[0],item.path) : stamp(cloud[0]) === item.old.stamp;
+    if (!unchanged) throw Error('雲端內容已修改，取消刪除：' + item.path);
+    checkStop();
+    await api('drive/v3/files/' + encodeURIComponent(item.found.id) + '?supportsAllDrives=true', {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({trashed:true})});
+  } else {
+    if (cloud.length || !local || !await confirmedDriveRemoval(item.old.id || item.old.stamp.split('|')[0],item.parent.id)) throw Error('無法確認雲端刪除或項目已恢復：' + item.path);
+    const unchanged = item.isFolder ? local.kind === 'directory' && await unchangedTree('local',local,item.path) : local.kind === 'file' && await digest(await local.getFile()) === item.old.hash;
+    if (!unchanged) throw Error('本機內容已修改，取消刪除：' + item.path);
+    checkStop();
+    await item.directory.handle.removeEntry(item.name,{recursive:!!item.isFolder});
+  }
+  dropBaseline(item.path);
+  await saveFolders();
+}
 async function buildPlan() {
   auth();
   if (!localRoot || !remoteRoot) throw Error('請先選擇兩個資料夾。');
@@ -141,6 +207,10 @@ async function buildPlan() {
     const local = new Map();
     if (directory.handle) for await (const [name, handle] of directory.handle.entries()) local.set(name, handle);
     const names = new Set([...local.keys(), ...existing.map(localName)]);
+    // Both sides absent: remove stale history so a later new file is not mistaken for a deletion.
+    for (const map of [baselines,directoryBaselines]) for (const key of [...map.keys()]) {
+      if (key.startsWith(path) && !key.slice(path.length).includes('/') && !names.has(key.slice(path.length))) dropBaseline(key);
+    }
     const folded = new Map();
     for (const name of names) {
       const key = name.toLowerCase();
@@ -155,10 +225,19 @@ async function buildPlan() {
       const found = matches[0];
       if (found && handle && (found.mimeType === folderType) !== (handle.kind === 'directory')) throw Error('檔案與資料夾名稱衝突：' + fullPath);
       if (handle?.kind === 'directory' || found?.mimeType === folderType) {
+        const tracked = directoryBaselines.get(fullPath);
+        if (tracked && (!found || !handle)) {
+          const kind = !handle ? 'deleteRemote' : 'deleteLocal';
+          const unchanged = !handle ? found.id === tracked.id && await unchangedTree('remote',found,fullPath) : await unchangedTree('local',handle,fullPath);
+          const removed = !found ? await confirmedDriveRemoval(tracked.id,parent.id) : true;
+          operations.push(unchanged && removed ? {kind,name,parent,directory,found,handle,path:fullPath,old:tracked,isFolder:true} : {kind:'conflict',path:fullPath,reason:'資料夾單邊刪除，但另一邊有新增、修改或無法確認刪除；不刪除'});
+          continue;
+        }
         const child = {id: found?.id}, localChild = {handle};
         if (!found) operations.push({kind: 'folder', name, parent, child, path: fullPath});
-        if (!handle) operations.push({kind: 'localFolder', name, directory, localChild, path: fullPath});
+        if (!handle) operations.push({kind: 'localFolder', name, directory, localChild, remoteId:found.id, path: fullPath});
         await walk(localChild, child, fullPath + '/');
+        if (found && handle) directoryBaselines.set(fullPath,{id:found.id});
         continue;
       }
       if (found?.mimeType.startsWith('application/vnd.google-apps.') && !isRepresentation(found)) { operations.push({kind:'skip', path: fullPath, reason:'此 Google 原生檔案類型尚不支援匯出'}); continue; }
@@ -166,6 +245,13 @@ async function buildPlan() {
       // Bound memory use: browser hashing and uploads buffer whole files.
       if ((file?.size || 0) > 500 * 1024 * 1024 || Number(found?.size || 0) > 500 * 1024 * 1024) { operations.push({kind:'skip', path:fullPath, reason:'第一版單檔上限為 500 MiB'}); continue; }
       const hash = file ? await digest(file) : null;
+      const tracked = baselines.get(fullPath);
+      if (tracked && (!handle || !found)) {
+        const unchanged = !handle ? tracked.stamp === stamp(found) : tracked.hash === hash;
+        const removed = !found ? await confirmedDriveRemoval(tracked.stamp.split('|')[0],parent.id) : true;
+        operations.push(unchanged && removed ? {kind:!handle ? 'deleteRemote':'deleteLocal',name,parent,directory,found,handle,hash,path:fullPath,old:tracked} : {kind:'conflict',path:fullPath,reason:'單邊刪除但另一邊已修改，或無法確認刪除；保留檔案'});
+        continue;
+      }
       let kind = !handle ? 'download' : !found ? 'file' : null;
       if (handle && found) {
         const old = baselines.get(fullPath);
@@ -193,9 +279,10 @@ async function buildPlan() {
 async function preview() {
   invalidate(); $('log').textContent = '';
   plan = await buildPlan();
-  for (const item of plan) log(`${({folder:'建立雲端資料夾',localFolder:'建立本機資料夾',file:'上傳至雲端',download:'下載至電腦',conflict:'衝突，略過',skip:'不支援，略過'})[item.kind]}：${item.path}${item.found && isRepresentation(item.found) ? (item.found.mimeType === shortcutType ? '（建立網路捷徑，不複製目標內容）' : '（Google 原稿匯出至電腦）') : ''}${item.reason ? ' — ' + item.reason : ''}`);
+  await saveFolders();
+  for (const item of plan) log(`${({deleteRemote:'移到 Drive 垃圾桶',deleteLocal:'刪除本機項目（不經資源回收筒）',folder:'建立雲端資料夾',localFolder:'建立本機資料夾',file:'上傳至雲端',download:'下載至電腦',conflict:'衝突，略過',skip:'不支援，略過'})[item.kind]}：${item.path}${item.kind === 'download' && item.found && isRepresentation(item.found) ? (item.found.mimeType === shortcutType ? '（建立網路捷徑，不複製目標內容）' : '（Google 原稿匯出至電腦）') : ''}${item.reason ? ' — ' + item.reason : ''}`);
   $('sync').disabled = !plan.length;
-  return `預覽完成：${plan.length} 項變更（包含衝突與略過項目；不會同步刪除）。`;
+  return `預覽完成：${plan.length} 項變更（包含衝突與略過項目；包含單邊刪除，請確認刪除清單）。`;
 }
 async function sync() {
   if (!plan) throw Error('請先預覽。');
@@ -204,14 +291,16 @@ async function sync() {
   for (const item of pending) {
     checkStop();
     if (item.kind === 'conflict' || item.kind === 'skip') { skipped++; log('略過：' + item.path + ' — ' + item.reason); continue; }
-    if (item.kind === 'folder') {
+    if (item.kind === 'deleteLocal' || item.kind === 'deleteRemote') {
+      await executeDeletion(item);
+    } else if (item.kind === 'folder') {
       if ((await children(item.parent.id)).some(f => localName(f) === item.name)) throw Error('雲端資料夾已變更，請重新預覽：' + item.path);
       const result = await api('drive/v3/files?supportsAllDrives=true', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:item.name,mimeType:folderType,parents:[item.parent.id]})});
-      item.child.id = result.id;
+      item.child.id = result.id; directoryBaselines.set(item.path,{id:result.id});
     } else if (item.kind === 'localFolder') {
       try { await item.directory.handle.getDirectoryHandle(item.name); throw Error('本機資料夾已變更，請重新預覽：' + item.path); }
       catch (e) { if (e.name !== 'NotFoundError') throw e; }
-      item.localChild.handle = await item.directory.handle.getDirectoryHandle(item.name,{create:true});
+      item.localChild.handle = await item.directory.handle.getDirectoryHandle(item.name,{create:true}); directoryBaselines.set(item.path,{id:item.remoteId});
     } else {
       const current = (await children(item.parent.id)).filter(f => localName(f) === item.name);
       if (item.found ? current.length !== 1 || stamp(current[0]) !== stamp(item.found) : current.length !== 0) throw Error('預覽後雲端已變更，請重新預覽：' + item.path);
@@ -241,8 +330,10 @@ async function sync() {
         baselines.set(item.path,{hash:item.hash,stamp:stamp(saved)});
       }
     }
+    await saveFolders();
     completed++; log('完成：' + item.path);
   }
+  await saveFolders();
   armed = !cancelled;
   return `同步完成：${completed} 項；衝突或不支援而略過 ${skipped} 項。`;
 }
@@ -259,7 +350,7 @@ $('login').onclick = () => {
   if (!window.google?.accounts) { $('status').textContent = 'Google 登入元件尚未載入，請檢查網路。'; return; }
   if (!GOOGLE_CONFIG.clientId.endsWith('.apps.googleusercontent.com')) { $('status').textContent = '網站的 Google 登入設定尚未完成，請聯絡管理者。'; return; }
   google.accounts.oauth2.initTokenClient({client_id: GOOGLE_CONFIG.clientId, scope: 'https://www.googleapis.com/auth/drive', callback: result => {
-    invalidate(); baselines.clear(); restoredRemotePending = !!remoteRoot;
+    invalidate(); restoredRemotePending = !!remoteRoot;
     if (result.error) { $('status').textContent = result.error; return; }
     token = result.access_token; expires = Date.now() + (Number(result.expires_in) - 60) * 1000;
     $('status').textContent = localRoot && remoteRoot ? '已登入；已恢復資料夾，請先預覽。' : '已登入，請選擇資料夾。';
@@ -268,7 +359,7 @@ $('login').onclick = () => {
 $('local').onclick = () => run(async () => {
   if (!window.showDirectoryPicker) throw Error('請使用桌面 Chrome 或 Edge，並透過 HTTPS 或 localhost 開啟。');
   const selected = await window.showDirectoryPicker({mode: 'readwrite'});
-  localRoot = selected; baselines.clear(); invalidate(); $('localName').textContent = selected.name; $('restoreLocal').hidden = true; await saveFolders(); return '已選擇電腦資料夾。';
+  if (!localRoot || !await localRoot.isSameEntry(selected)) clearBaselines(); localRoot = selected; invalidate(); $('localName').textContent = selected.name; $('restoreLocal').hidden = true; await saveFolders(); return '已選擇電腦資料夾。';
 });
 $('remote').onclick = () => run(async () => {
   auth();
@@ -277,7 +368,7 @@ $('remote').onclick = () => run(async () => {
   return new Promise(resolve => {
     const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS).setIncludeFolders(true).setSelectFolderEnabled(true);
     new google.picker.PickerBuilder().addView(view).setOAuthToken(token).setDeveloperKey(GOOGLE_CONFIG.pickerApiKey).setAppId(GOOGLE_CONFIG.projectNumber).setOrigin(location.origin).setCallback(async data => {
-      if (data.action === google.picker.Action.PICKED) { remoteRoot = data.docs[0].id; baselines.clear(); invalidate(); $('remoteName').textContent = data.docs[0].name; rememberedRemote = {id:remoteRoot,name:data.docs[0].name}; restoredRemotePending = true; await saveFolders(); resolve('已選擇 Google Drive 目的資料夾。'); }
+      if (data.action === google.picker.Action.PICKED) { if (remoteRoot !== data.docs[0].id) clearBaselines(); remoteRoot = data.docs[0].id; invalidate(); $('remoteName').textContent = data.docs[0].name; rememberedRemote = {id:remoteRoot,name:data.docs[0].name}; restoredRemotePending = true; await saveFolders(); resolve('已選擇 Google Drive 目的資料夾。'); }
       if (data.action === google.picker.Action.CANCEL) resolve('已取消選擇。');
     }).build().setVisible(true);
   });
@@ -298,7 +389,7 @@ $('restoreLocal').onclick = () => run(async () => {
 $('forget').onclick = () => run(async () => {
   await folderStore('readwrite', store => store.delete('selection'));
   localRoot = null; remoteRoot = null; rememberedRemote = null; restoredRemotePending = false;
-  baselines.clear(); invalidate(); $('auto').checked = false;
+  clearBaselines(); invalidate(); $('auto').checked = false;
   $('localName').textContent = $('remoteName').textContent = '尚未選擇';
   $('restoreLocal').hidden = true;
   $('memoryStatus').textContent = '已忘記資料夾；電腦與 Drive 的檔案未刪除。';

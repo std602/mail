@@ -39,6 +39,21 @@ try:
         page.locator('#login').click()
         page.locator('#remote').click()
         page.wait_for_function("!document.getElementById('remote').disabled && document.getElementById('remoteName').textContent === 'Remembered Drive'")
+        # Establish a real persisted baseline, then verify deletion detection after reload.
+        page.evaluate("""(async()=>{const d=await (await navigator.storage.getDirectory()).getDirectoryHandle('remembered-folder');const f=await d.getFileHandle('remember.txt',{create:true});const w=await f.createWritable();await w.write('same');await w.close();})()""")
+        def drive_api(route):
+            url = route.request.url
+            if 'alt=media' in url:
+                route.fulfill(status=200, body='same')
+            elif '/files?' in url:
+                route.fulfill(json={'files':[{'id':'remember-file','name':'remember.txt','mimeType':'text/plain','size':'4','modifiedTime':'2026-01-01T00:00:00Z'}]})
+            else:
+                route.fulfill(json={'id':'drive-folder','name':'Remembered Drive','mimeType':'application/vnd.google-apps.folder','trashed':False})
+        page.route('https://www.googleapis.com/**', drive_api)
+        page.locator('#preview').click()
+        page.wait_for_function("document.getElementById('status').textContent.includes('預覽完成')")
+        saved = page.evaluate("""new Promise((resolve,reject)=>{const r=indexedDB.open('drive-sync-folders',1);r.onsuccess=()=>{const db=r.result;const q=db.transaction('settings').objectStore('settings').get('selection');q.onsuccess=()=>{resolve(q.result.baselines);db.close()}};r.onerror=()=>reject(r.error)})""")
+        assert len(saved) == 1 and saved[0][0] == 'remember.txt'
         page.reload(wait_until='networkidle')
         page.wait_for_function("!document.getElementById('local').disabled")
         assert 'remembered-folder' in page.locator('#localName').inner_text()
@@ -46,6 +61,12 @@ try:
         assert page.locator('#status').inner_text() == '尚未登入'
         assert not page.locator('#auto').is_checked()
         assert page.locator('#sync').is_disabled()
+        page.evaluate("""window.google={accounts:{oauth2:{initTokenClient(config){return {requestAccessToken(){config.callback({access_token:'mock',expires_in:3600})}}}}}}""")
+        page.locator('#login').click()
+        page.evaluate("""(async()=>{const d=await (await navigator.storage.getDirectory()).getDirectoryHandle('remembered-folder');await d.removeEntry('remember.txt');})()""")
+        page.locator('#preview').click()
+        page.wait_for_function("document.getElementById('status').textContent.includes('預覽完成')")
+        assert '移到 Drive 垃圾桶' in page.locator('#log').inner_text()
         # A restored handle with expired permission requires a user click.
         page.add_init_script('''FileSystemHandle.prototype.queryPermission = async () => 'prompt'; FileSystemHandle.prototype.requestPermission = async () => 'granted';''')
         page.reload(wait_until='networkidle')
@@ -61,7 +82,7 @@ try:
         assert page.locator('#remoteName').inner_text() == '尚未選擇'
         assert page.evaluate("(async()=>!!await (await navigator.storage.getDirectory()).getDirectoryHandle('remembered-folder'))()")
         assert not errors, errors
-        print('PASS: persist both folder selections, restore after reload, require renewed local permission, do not restore auth or auto-sync, forget without deleting directory')
+        print('PASS: persist folders and baseline, detect deletion after reload, require renewed local permission, do not restore auth or auto-sync, forget without deleting directory')
         browser.close()
 finally:
     server.shutdown()
